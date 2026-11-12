@@ -13,6 +13,9 @@ function saveLedger(v){const f=path.join(data,'payments.json'),tmp=f+'.'+process
 function totals(){const sums={};for(const v of Object.values(ledger())){if(v.campaignId&&v.status==='paid')sums[v.campaignId]=(sums[v.campaignId]||0)+Math.max(0,v.amount-(v.refunded||0))}return sums}
 function withTotals(c){const t=totals();return c.map(x=>({...x,raised:(t[x.id]||0)/100}))}
 function supporters(id){return Object.values(ledger()).filter(v=>v.campaignId===id&&v.status==='paid'&&v.amount>0).sort((a,b)=>String(b.paidAt||'').localeCompare(String(a.paidAt||''))).slice(0,20).map(v=>({name:v.anonymous===false&&v.displayName?v.displayName:'Anonymous',amount:v.amount/100,date:v.paidAt||null}))}
+// Only authenticated admins can upload images. Store on Render's persistent DATA_DIR.
+const uploads=path.join(data,'uploads');fs.mkdirSync(uploads,{recursive:true});
+function imageType(b){if(b.length>=3&&b[0]===255&&b[1]===216&&b[2]===255)return 'image/jpeg';if(b.length>=8&&b.subarray(0,8).equals(Buffer.from('89504e470d0a1a0a','hex')))return 'image/png';if(b.length>=12&&b.toString('ascii',0,4)==='RIFF'&&b.toString('ascii',8,12)==='WEBP')return 'image/webp';return null}
 function cleanName(v){if(typeof v!=='string')return '';const n=v.trim().replace(/\s+/g,' ');if(n.length>60||/[<>\x00-\x1f]/.test(n))throw Error('Invalid supporter name');return n}
 
 function rawBody(req,max=1048576){return new Promise((resolve,reject)=>{let a=[],n=0;req.on('data',b=>{n+=b.length;if(n>max){reject(Error('Request too large'));req.destroy()}else a.push(b)});req.on('end',()=>resolve(Buffer.concat(a)));req.on('error',reject)})}
@@ -23,11 +26,17 @@ function cookie(req){return (req.headers.cookie||'').split(';').map(x=>x.trim())
 function authed(req){const t=cookie(req);return !!(t&&sessions.get(crypto.createHash('sha256').update(t).digest('hex'))>Date.now())}
 function limit(req){let k=req.socket.remoteAddress||'unknown',a=attempts.get(k)||[],now=Date.now();a=a.filter(x=>now-x<3600000);a.push(now);attempts.set(k,a);return a.length>20}
 async function parse(req){let parts=[],n=0;for await(let x of req){n+=x.length;if(n>12000)throw Error('Request too large');parts.push(x)}return JSON.parse(Buffer.concat(parts).toString()||'{}')}
-function validate(b){if(typeof b.title!=='string'||!b.title.trim()||b.title.length>100||typeof b.story!=='string'||b.story.trim().length<10||b.story.length>6000||!Number.isInteger(b.goal)||b.goal<1||b.goal>100000000||typeof b.image!=='string'||b.image.length>1500||(b.image&&!/^https:\/\//i.test(b.image))||typeof b.published!=='boolean')throw Error('Invalid fundraiser fields');return {title:b.title.trim(),story:b.story.trim(),goal:b.goal,image:b.image,published:b.published}}
+function validate(b){if(typeof b.title!=='string'||!b.title.trim()||b.title.length>100||typeof b.story!=='string'||b.story.trim().length<10||b.story.length>6000||!Number.isInteger(b.goal)||b.goal<1||b.goal>100000000||typeof b.image!=='string'||b.image.length>1500||(b.image&&!(/^https:\/\//i.test(b.image)||/^\/uploads\/[a-f0-9-]{36}\.(jpg|png|webp)$/.test(b.image)))||typeof b.published!=='boolean')throw Error('Invalid fundraiser fields');return {title:b.title.trim(),story:b.story.trim(),goal:b.goal,image:b.image,published:b.published}}
 const safeCompare=(a,b)=>{let x=crypto.createHash('sha256').update(String(a)).digest(),y=crypto.createHash('sha256').update(String(b)).digest();return crypto.timingSafeEqual(x,y)};
 http.createServer(async(req,res)=>{try{const u=new URL(req.url,'http://localhost'),p=u.pathname;
 if(['POST','PUT','PATCH','DELETE'].includes(req.method)&&p!=='/api/stripe/webhook'&&!sameOrigin(req))return send(res,403,{error:'Invalid request origin'});
 if(req.method==='GET'&&(p==='/'||/^\/f\/[a-f0-9-]{36}\/?$/.test(p))){let h=fs.readFileSync(path.join(pub,'index.html'));res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"});return res.end(h)}
+if(req.method==='GET'&&/^\/uploads\/[a-f0-9-]{36}\.(jpg|png|webp)$/.test(p)){
+ const f=path.join(uploads,path.basename(p));let st;try{st=fs.statSync(f)}catch{return send(res,404,{error:'Image not found'})}
+ if(!st.isFile())return send(res,404,{error:'Image not found'});
+ const ext=path.extname(f),mime=ext==='.png'?'image/png':ext==='.webp'?'image/webp':'image/jpeg';
+ res.writeHead(200,{'Content-Type':mime,'Content-Length':st.size,'Cache-Control':'public, max-age=31536000, immutable','X-Content-Type-Options':'nosniff'});return fs.createReadStream(f).pipe(res);
+}
 if(req.method==='GET'&&p==='/api/health')return send(res,200,{ok:true,stripeConfigured:!!process.env.STRIPE_SECRET_KEY,webhookConfigured:!!process.env.STRIPE_WEBHOOK_SECRET});
 if(req.method==='GET'&&p==='/api/campaigns')return send(res,200,withTotals(read().filter(x=>x.published)));
  let publicMatch=p.match(/^\/api\/campaigns\/([a-f0-9-]{36})$/);
@@ -35,7 +44,17 @@ if(req.method==='GET'&&p==='/api/campaigns')return send(res,200,withTotals(read(
 
 if(req.method==='POST'&&p==='/api/login'){if(limit(req))return send(res,429,{error:'Too many login attempts'});let b=await parse(req);if(!safeCompare(b.password||'',PASSWORD))return send(res,401,{error:'Incorrect password'});let t=crypto.randomBytes(32).toString('hex');sessions.set(crypto.createHash('sha256').update(t).digest('hex'),Date.now()+8*3600000);res.setHeader('Set-Cookie',`sid=${t}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${process.env.NODE_ENV==='production'?'; Secure':''}`);return send(res,200,{ok:true})}
 if(req.method==='POST'&&p==='/api/logout'){let t=cookie(req);if(t)sessions.delete(crypto.createHash('sha256').update(t).digest('hex'));res.setHeader('Set-Cookie','sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');return send(res,200,{ok:true})}
-if(p.startsWith('/api/admin/')){if(!authed(req))return send(res,401,{error:'Admin login required'});if(req.method==='GET'&&p==='/api/admin/campaigns')return send(res,200,withTotals(read()));if(req.method==='POST'&&p==='/api/admin/campaigns'){let b=validate(await parse(req)),a=read(),c={...b,id:crypto.randomUUID(),createdAt:new Date().toISOString()};a.unshift(c);write(a);return send(res,201,c)}let m=p.match(/^\/api\/admin\/campaigns\/([a-f0-9-]{36})$/);if(m){let a=read(),i=a.findIndex(x=>x.id===m[1]);if(i<0)return send(res,404,{error:'Not found'});if(req.method==='PUT'){a[i]={...a[i],...validate(await parse(req))};write(a);return send(res,200,a[i])}if(req.method==='DELETE'){a.splice(i,1);write(a);return send(res,200,{ok:true})}}}
+if(p.startsWith('/api/admin/')){if(!authed(req))return send(res,401,{error:'Admin login required'});if(req.method==='POST'&&p==='/api/admin/upload-image'){
+ const type=String(req.headers['content-type']||'').split(';')[0].toLowerCase();
+ if(!['image/jpeg','image/png','image/webp'].includes(type))return send(res,415,{error:'Choose a JPG, PNG or WebP image'});
+ const bytes=await rawBody(req,4*1024*1024);
+ if(bytes.length<100||imageType(bytes)!==type)return send(res,400,{error:'Invalid image file'});
+ const ext=type==='image/jpeg'?'jpg':type==='image/png'?'png':'webp';
+ const filename=crypto.randomUUID()+'.'+ext;
+ fs.writeFileSync(path.join(uploads,filename),bytes,{flag:'wx',mode:0o644});
+ return send(res,201,{url:'/uploads/'+filename});
+}
+if(req.method==='GET'&&p==='/api/admin/campaigns')return send(res,200,withTotals(read()));if(req.method==='POST'&&p==='/api/admin/campaigns'){let b=validate(await parse(req)),a=read(),c={...b,id:crypto.randomUUID(),createdAt:new Date().toISOString()};a.unshift(c);write(a);return send(res,201,c)}let m=p.match(/^\/api\/admin\/campaigns\/([a-f0-9-]{36})$/);if(m){let a=read(),i=a.findIndex(x=>x.id===m[1]);if(i<0)return send(res,404,{error:'Not found'});if(req.method==='PUT'){a[i]={...a[i],...validate(await parse(req))};write(a);return send(res,200,a[i])}if(req.method==='DELETE'){a.splice(i,1);write(a);return send(res,200,{ok:true})}}}
 if(req.method==='POST'&&p==='/api/checkout'){
 const b=await parse(req),campaign=read().find(x=>x.id===b.campaignId&&x.published);
 if(!campaign)return send(res,404,{error:'Fundraiser unavailable'});
