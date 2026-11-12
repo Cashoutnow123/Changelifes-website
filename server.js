@@ -31,6 +31,14 @@ const safeCompare=(a,b)=>{let x=crypto.createHash('sha256').update(String(a)).di
 http.createServer(async(req,res)=>{try{const u=new URL(req.url,'http://localhost'),p=u.pathname;
 if(['POST','PUT','PATCH','DELETE'].includes(req.method)&&p!=='/api/stripe/webhook'&&!sameOrigin(req))return send(res,403,{error:'Invalid request origin'});
 if(req.method==='GET'&&(p==='/'||/^\/f\/[a-f0-9-]{36}\/?$/.test(p))){let h=fs.readFileSync(path.join(pub,'index.html'));res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"});return res.end(h)}
+// Serve the public logo without changing payment, admin, or upload routes.
+if(req.method==='GET'&&p==='/changelifes-logo.png'){
+ const file=path.join(pub,'changelifes-logo.png');
+ let stat;try{stat=fs.statSync(file)}catch{return send(res,404,{error:'Logo not found'})}
+ if(!stat.isFile())return send(res,404,{error:'Logo not found'});
+ res.writeHead(200,{'Content-Type':'image/png','Content-Length':stat.size,'X-Content-Type-Options':'nosniff','Cache-Control':'public, max-age=3600'});
+ return fs.createReadStream(file).pipe(res);
+}
 if(req.method==='GET'&&/^\/uploads\/[a-f0-9-]{36}\.(jpg|png|webp)$/.test(p)){
  const f=path.join(uploads,path.basename(p));let st;try{st=fs.statSync(f)}catch{return send(res,404,{error:'Image not found'})}
  if(!st.isFile())return send(res,404,{error:'Image not found'});
