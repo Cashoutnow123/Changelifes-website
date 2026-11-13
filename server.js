@@ -46,6 +46,15 @@ if(req.method==='GET'&&/^\/uploads\/[a-f0-9-]{36}\.(jpg|png|webp)$/.test(p)){
  res.writeHead(200,{'Content-Type':mime,'Content-Length':st.size,'Cache-Control':'public, max-age=31536000, immutable','X-Content-Type-Options':'nosniff'});return fs.createReadStream(f).pipe(res);
 }
 if(req.method==='GET'&&p==='/api/health')return send(res,200,{ok:true,stripeConfigured:!!process.env.STRIPE_SECRET_KEY,webhookConfigured:!!process.env.STRIPE_WEBHOOK_SECRET});
+// Public completed-donation history: no failed/canceled payments or private payment details.
+const historyMatch=p.match(/^\/api\/campaigns\/([a-f0-9-]{36})\/donations$/);
+if(req.method==='GET'&&historyMatch){
+ const id=historyMatch[1];if(!read().some(c=>c.id===id&&c.published))return send(res,404,{error:'Fundraiser unavailable'});
+ const page=Math.max(1,Math.min(100000,Number.parseInt(u.searchParams.get('page')||'1',10)||1)),size=25;
+ const records=Object.values(ledger()).filter(v=>v.campaignId===id&&v.status==='paid'&&Number(v.amount)>0).sort((a,b)=>String(b.paidAt||'').localeCompare(String(a.paidAt||'')));
+ const entries=records.slice((page-1)*size,page*size).map(v=>({name:v.anonymous===false&&v.displayName?String(v.displayName).slice(0,60):'Anonymous',amount:Math.max(0,Number(v.amount||0)-Number(v.refunded||0))/100,date:v.paidAt||null}));
+ return send(res,200,{donations:entries,page,hasMore:page*size<records.length});
+}
 if(req.method==='GET'&&p==='/api/campaigns')return send(res,200,withTotals(read().filter(x=>x.published)));
  let publicMatch=p.match(/^\/api\/campaigns\/([a-f0-9-]{36})$/);
  if(req.method==='GET'&&publicMatch){const c=read().find(x=>x.id===publicMatch[1]&&x.published);return c?send(res,200,{...withTotals([c])[0],supporters:supporters(c.id)}):send(res,404,{error:'Fundraiser unavailable'})}
@@ -61,6 +70,22 @@ if(p.startsWith('/api/admin/')){if(!authed(req))return send(res,401,{error:'Admi
  const filename=crypto.randomUUID()+'.'+ext;
  fs.writeFileSync(path.join(uploads,filename),bytes,{flag:'wx',mode:0o644});
  return send(res,201,{url:'/uploads/'+filename});
+}
+if(req.method==='GET'&&p==='/api/admin/summary'){
+ const records=Object.values(ledger()).filter(v=>v.status==='paid'&&v.campaignId);
+ const totalCents=records.reduce((sum,v)=>sum+Math.max(0,Number(v.amount||0)-Number(v.refunded||0)),0);
+ return send(res,200,{totalRaised:totalCents/100,donationCount:records.length});
+}
+if(req.method==='GET'&&/^\/api\/admin\/campaigns\/[a-f0-9-]{36}\/activity$/.test(p)){
+ const id=p.split('/')[4];const campaign=read().find(c=>c.id===id);
+ if(!campaign)return send(res,404,{error:'Fundraiser not found'});
+ const donations=Object.values(ledger()).filter(v=>v.campaignId===id&&v.status==='paid').sort((a,b)=>String(b.paidAt||'').localeCompare(String(a.paidAt||'')));
+ const net=v=>Math.max(0,Number(v.amount||0)-Number(v.refunded||0));
+ const total=donations.reduce((s,v)=>s+net(v),0);
+ const now=Date.now(),today=new Date().toISOString().slice(0,10);
+ const dayTotal=donations.filter(v=>String(v.paidAt||'').slice(0,10)===today).reduce((s,v)=>s+net(v),0);
+ const recent=donations.map(v=>({name:v.anonymous?'Anonymous':cleanName(v.displayName||'')||'Anonymous',amount:net(v)/100,date:v.paidAt||null,refunded:Number(v.refunded||0)/100}));
+ return send(res,200,{campaign:withTotals([campaign])[0],donationCount:donations.length,totalRaised:total/100,raisedToday:dayTotal/100,largestDonation:donations.length?Math.max(...donations.map(net))/100:0,lastDonation:donations[0]?.paidAt||null,donations:recent});
 }
 if(req.method==='GET'&&p==='/api/admin/campaigns')return send(res,200,withTotals(read()));if(req.method==='POST'&&p==='/api/admin/campaigns'){let b=validate(await parse(req)),a=read(),c={...b,id:crypto.randomUUID(),createdAt:new Date().toISOString()};a.unshift(c);write(a);return send(res,201,c)}let m=p.match(/^\/api\/admin\/campaigns\/([a-f0-9-]{36})$/);if(m){let a=read(),i=a.findIndex(x=>x.id===m[1]);if(i<0)return send(res,404,{error:'Not found'});if(req.method==='PUT'){a[i]={...a[i],...validate(await parse(req))};write(a);return send(res,200,a[i])}if(req.method==='DELETE'){a.splice(i,1);write(a);return send(res,200,{ok:true})}}}
 if(req.method==='POST'&&p==='/api/checkout'){
