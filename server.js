@@ -71,6 +71,36 @@ if(p.startsWith('/api/admin/')){if(!authed(req))return send(res,401,{error:'Admi
  fs.writeFileSync(path.join(uploads,filename),bytes,{flag:'wx',mode:0o644});
  return send(res,201,{url:'/uploads/'+filename});
 }
+const manualRoute=p.match(/^\/api\/admin\/campaigns\/([a-f0-9-]{36})\/manual-donations(?:\/([a-f0-9-]{36}))?$/);
+if(manualRoute){
+ const cid=manualRoute[1],entryId=manualRoute[2];
+ if(!read().some(c=>c.id===cid))return send(res,404,{error:'Fundraiser not found'});
+ if(req.method==='POST'&&!entryId){
+  const b=await parse(req),amount=Number(b.amount);
+  if(!Number.isSafeInteger(amount)||amount<1||amount>100000000)return send(res,400,{error:'Enter a valid amount in cents'});
+  const anonymous=b.anonymous!==false,displayName=anonymous?'':cleanName(b.displayName);
+  if(!anonymous&&!displayName)return send(res,400,{error:'Enter a name or choose Anonymous'});
+  const note=typeof b.note==='string'?b.note.trim():'';
+  if(note.length>200)return send(res,400,{error:'Note too long'});
+  const id=crypto.randomUUID(),l=ledger();
+  l['manual:'+id]={source:'manual',campaignId:cid,amount,refunded:0,status:'paid',anonymous,displayName,paidAt:new Date().toISOString(),note};
+  saveLedger(l);return send(res,201,{id,ok:true});
+ }
+ if(req.method==='POST'&&entryId){
+  const l=ledger(),v=l['manual:'+entryId];
+  if(!v||v.campaignId!==cid||v.source!=='manual')return send(res,404,{error:'Manual donation not found'});
+  if(v.status!=='paid')return send(res,409,{error:'Already voided'});
+  const b=await parse(req);if(b.action!=='void')return send(res,400,{error:'Invalid action'});
+  v.status='voided';v.voidedAt=new Date().toISOString();saveLedger(l);return send(res,200,{ok:true});
+ }
+ if(req.method==='GET'&&!entryId){
+  const donations=Object.entries(ledger()).filter(([k,v])=>k.startsWith('manual:')&&v.campaignId===cid)
+  .map(([k,v])=>({id:k.slice(7),name:v.anonymous?'Anonymous':v.displayName,amount:v.amount/100,date:v.paidAt,status:v.status,note:v.note||''}))
+  .sort((a,b)=>String(b.date).localeCompare(String(a.date)));
+  return send(res,200,{donations});
+ }
+ return send(res,405,{error:'Method not allowed'});
+}
 if(req.method==='GET'&&p==='/api/admin/summary'){
  const records=Object.values(ledger()).filter(v=>v.status==='paid'&&v.campaignId);
  const totalCents=records.reduce((sum,v)=>sum+Math.max(0,Number(v.amount||0)-Number(v.refunded||0)),0);
